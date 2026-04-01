@@ -15,14 +15,14 @@ import sys
 import time
 from pathlib import Path
 
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
+from google import genai
+from google.genai import types
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 
 CAPTION_PROMPT = """You are annotating military training footage of LCAC (Landing Craft Air Cushion) hovercraft operations for an AI model training dataset.
 
@@ -43,15 +43,18 @@ RETRY_DELAY = 5  # seconds between retries
 # Helpers
 # ---------------------------------------------------------------------------
 
-def upload_clip(client_file_api, path: Path) -> object:
+def upload_clip(client: genai.Client, path: Path):
     """Upload a video file to Gemini Files API and wait for processing."""
     print(f"  Uploading {path.name}...", end="", flush=True)
-    video_file = genai.upload_file(path=str(path), mime_type=UPLOAD_MIME)
+    video_file = client.files.upload(
+        file=str(path),
+        config=types.UploadFileConfig(mime_type=UPLOAD_MIME),
+    )
 
     # Poll until the file is ACTIVE
     while video_file.state.name == "PROCESSING":
         time.sleep(2)
-        video_file = genai.get_file(video_file.name)
+        video_file = client.files.get(name=video_file.name)
 
     if video_file.state.name != "ACTIVE":
         raise RuntimeError(f"File upload failed with state: {video_file.state.name}")
@@ -60,19 +63,24 @@ def upload_clip(client_file_api, path: Path) -> object:
     return video_file
 
 
-def generate_caption(model, video_file) -> str:
+def generate_caption(client: genai.Client, model: str, video_file) -> str:
     """Generate a caption for an uploaded video file."""
-    response = model.generate_content(
-        [video_file, CAPTION_PROMPT],
-        request_options={"timeout": 60},
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(parts=[
+                types.Part(file_data=types.FileData(file_uri=video_file.uri, mime_type=UPLOAD_MIME)),
+                types.Part(text=CAPTION_PROMPT),
+            ])
+        ],
     )
     return response.text.strip()
 
 
-def delete_file(video_file):
+def delete_file(client: genai.Client, video_file):
     """Delete an uploaded file from Gemini Files API."""
     try:
-        genai.delete_file(video_file.name)
+        client.files.delete(name=video_file.name)
     except Exception:
         pass  # Non-fatal
 
@@ -105,9 +113,7 @@ def main():
         print(f"No .mp4 files found in {clips_dir}")
         sys.exit(0)
 
-    # Configure Gemini
-    genai.configure(api_key=args.api_key)
-    model = genai.GenerativeModel(args.model)
+    client = genai.Client(api_key=args.api_key)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,12 +148,12 @@ def main():
 
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    video_file = upload_clip(genai, clip)
+                    video_file = upload_clip(client, clip)
                     print(f"  Generating caption...", end="", flush=True)
-                    caption = generate_caption(model, video_file)
+                    caption = generate_caption(client, args.model, video_file)
                     print(" done.", flush=True)
                     break
-                except (google_exceptions.GoogleAPIError, RuntimeError, Exception) as e:
+                except Exception as e:
                     print(f"\n  Attempt {attempt} failed: {e}")
                     if attempt < MAX_RETRIES:
                         print(f"  Retrying in {RETRY_DELAY}s...")
@@ -157,7 +163,7 @@ def main():
                         failed.append(clip.name)
                 finally:
                     if video_file:
-                        delete_file(video_file)
+                        delete_file(client, video_file)
                         video_file = None
 
             if caption is None:
